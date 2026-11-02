@@ -467,13 +467,32 @@ mod tests {
         // a 2-byte buffer. This must not be rounded down to 1.
         assert_eq!(buf_size(2), 2);
     }
+
+    #[test]
+    fn test_find_available_buffer_does_not_reuse_much_larger_buffers() {
+        let device = Device::system_default().unwrap();
+        let mut buffers = BufferMap::new();
+        let large = Arc::new(device.new_buffer(1 << 20, RESOURCE_OPTIONS).unwrap());
+        buffers.insert(1 << 20, vec![large]);
+
+        // A request up to half the bucket size reuses nothing.
+        assert!(find_available_buffer(1 << 10, &buffers).is_none());
+        assert!(find_available_buffer(1 << 18, &buffers).is_none());
+        // A request whose bucket is at least half the buffer size reuses it.
+        assert!(find_available_buffer((1 << 18) + 1, &buffers).is_some());
+        assert!(find_available_buffer(1 << 20, &buffers).is_some());
+    }
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
+    // Do not reuse a buffer much larger than the request. Without this cap, a
+    // small tensor that lives long (for example a KV cache entry) can take a
+    // large free buffer, and the pool must then allocate that size again.
+    let max_size = buf_size(size).saturating_mul(2);
     for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size {
+        if buffer_size >= &size && buffer_size <= &max_size && buffer_size < &best_buffer_size {
             for sub in subbuffers {
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);
