@@ -337,6 +337,19 @@ fn buf_size(size: usize) -> usize {
     size.next_power_of_two()
 }
 
+/// How many power-of-two size classes above its own a request may be served
+/// from when it reuses a pooled buffer. Same value as upstream PR 3851.
+const REUSE_SLACK: u32 = 2;
+
+/// The largest pooled buffer that a request of `size` bytes may reuse.
+///
+/// Without a cap, a small tensor that lives long (for example a KV cache
+/// entry) can take a large free buffer, and the pool must then allocate that
+/// size again. Pooled buffers are powers of two, so the cap is a shift.
+fn reuse_cap(size: usize) -> usize {
+    buf_size(size).saturating_mul(1usize << REUSE_SLACK)
+}
+
 /// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
 #[cfg(feature = "metal-debug-labels")]
 #[inline]
@@ -475,24 +488,33 @@ mod tests {
         let large = Arc::new(device.new_buffer(1 << 20, RESOURCE_OPTIONS).unwrap());
         buffers.insert(1 << 20, vec![large]);
 
-        // A request up to half the bucket size reuses nothing.
+        // A request up to a quarter of the bucket size reuses nothing.
         assert!(find_available_buffer(1 << 10, &buffers).is_none());
-        assert!(find_available_buffer(1 << 18, &buffers).is_none());
-        // A request whose bucket is at least half the buffer size reuses it.
-        assert!(find_available_buffer((1 << 18) + 1, &buffers).is_some());
+        assert!(find_available_buffer(1 << 17, &buffers).is_none());
+        // A request whose bucket is at least a quarter of the buffer size reuses it.
+        assert!(find_available_buffer((1 << 17) + 1, &buffers).is_some());
         assert!(find_available_buffer(1 << 20, &buffers).is_some());
+    }
+
+    #[test]
+    fn test_reuse_cap_is_two_size_classes_above_the_request() {
+        let kv = 9_437_184;
+        assert_eq!(buf_size(kv), 16 << 20);
+        assert_eq!(reuse_cap(kv), 64 << 20);
+    }
+
+    #[test]
+    fn test_reuse_cap_does_not_overflow() {
+        assert_eq!(reuse_cap(usize::MAX / 2), usize::MAX);
     }
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    let cap = reuse_cap(size);
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
-    // Do not reuse a buffer much larger than the request. Without this cap, a
-    // small tensor that lives long (for example a KV cache entry) can take a
-    // large free buffer, and the pool must then allocate that size again.
-    let max_size = buf_size(size).saturating_mul(2);
     for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size <= &max_size && buffer_size < &best_buffer_size {
+        if buffer_size >= &size && buffer_size <= &cap && buffer_size < &best_buffer_size {
             for sub in subbuffers {
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);
