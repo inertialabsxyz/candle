@@ -2065,6 +2065,11 @@ template <
   if (do_causal) {
     int q_max = (tid.x + 1) * BQ + params->qL_off;
     kb_lim = (q_max + BK - 1) / BK;
+    // A query block that is not full (qL < BQ, or the last block) makes
+    // q_max larger than kL. Without the clamp, the loop reads K blocks past
+    // kL, and the causal mask below starts too late to cover the last real
+    // block when kL is a multiple of BK.
+    kb_lim = min(params->NK, kb_lim);
   }
 
   // Loop over KV seq length
